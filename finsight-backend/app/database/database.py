@@ -1,6 +1,7 @@
 # database.py
-import asyncpg
 import os
+
+import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,17 +16,14 @@ class Database:
             self.pool = await asyncpg.create_pool(
                 host=os.getenv('DB_HOST', 'localhost'),
                 port=os.getenv('DB_PORT', '5432'),
-                database=os.getenv('DB_NAME', 'finsight_db'),
-                user=os.getenv('DB_USER', 'postgres'),
-                password=os.getenv('DB_PASSWORD', 'postgres'),
+                database=os.getenv('DB_NAME', 'finsight'),
+                user=os.getenv('DB_USER', 'omthorat'),
+                password=os.getenv('DB_PASSWORD', 'password'),
                 min_size=5,
                 max_size=20
             )
             print("✅ Connected to PostgreSQL database")
-            
-            # Create tables if they don't exist
-            await self.create_tables()
-            
+
         except Exception as e:
             print(f"❌ Database connection failed: {e}")
             raise
@@ -33,6 +31,10 @@ class Database:
     async def create_tables(self):
         """Create necessary tables"""
         async with self.pool.acquire() as conn:
+            # Support both gen_random_uuid() and uuid_generate_v4() across Postgres setups.
+            await conn.execute('CREATE EXTENSION IF NOT EXISTS "pgcrypto"')
+            await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+
             # Upload sessions table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS upload_sessions (
@@ -48,7 +50,7 @@ class Database:
                 )
             """)
             
-            # Feedback entries table
+            # Feedback entgries table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS feedback_entries (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -79,6 +81,21 @@ class Database:
                     processing_time_ms INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+
+            # Risk alert status table (persists manual actions like resolve)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS risk_alert_states (
+                    feedback_id UUID PRIMARY KEY REFERENCES feedback_entries(id) ON DELETE CASCADE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'new',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    resolved_at TIMESTAMP
+                )
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_risk_alert_states_status
+                ON risk_alert_states(status)
             """)
             
             print("✅ Database tables created/verified")

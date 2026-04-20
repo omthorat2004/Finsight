@@ -4,18 +4,40 @@ import json
 import os
 import random
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import httpx
 import pandas as pd
+from app.database.database import db
+from app.models.models import (DashboardSummary, FeedbackEntry, StatusResponse,
+                               UploadResponse)
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
-# Load environment variables
 load_dotenv()
 
-app = FastAPI(title="FinSight AI Backend")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and cleanup application resources."""
+    try:
+        # Import models and initialize database objects before serving requests.
+        _ = (UploadResponse, StatusResponse, FeedbackEntry, DashboardSummary)
+        await db.connect()
+        await db.create_tables()
+        await load_cache_from_db()
+        print(f"✅ Cache loaded: {len(feedbacks)} feedbacks, {len(uploads)} uploads")
+    except Exception as e:
+        print(f"⚠️ Running without DB persistence: {e}")
+
+    yield
+
+    await db.close()
+
+
+app = FastAPI(title="FinSight AI Backend", lifespan=lifespan)
 
 # CORS for React frontend
 app.add_middleware(
@@ -33,8 +55,210 @@ OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'deepseek-r1:1.5b')
 # In-memory storage
 feedbacks = []
 uploads = []
+resolved_alert_ids = set()
 
 
+async def get_risk_alert_status_map():
+    """Return persisted status by feedback id."""
+    if not db.pool:
+        return {feedback_id: "resolved" for feedback_id in resolved_alert_ids}
+
+    try:
+        rows = await db.fetch("SELECT feedback_id, status FROM risk_alert_states")
+        return {str(row["feedback_id"]): row["status"] for row in rows}
+    except Exception as e:
+        # Auto-heal if schema wasn't created yet in an existing DB.
+        if "risk_alert_states" in str(e):
+            await db.create_tables()
+            rows = await db.fetch("SELECT feedback_id, status FROM risk_alert_states")
+            return {str(row["feedback_id"]): row["status"] for row in rows}
+        return {}
+
+
+async def persist_risk_alert_status(alert_id, status):
+    """Persist risk alert state in database, with in-memory fallback."""
+    if not db.pool:
+        if status == "resolved":
+            resolved_alert_ids.add(alert_id)
+        else:
+            resolved_alert_ids.discard(alert_id)
+        return
+
+    try:
+        feedback_exists = await db.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM feedback_entries WHERE id = $1::uuid)",
+            alert_id,
+        )
+        if not feedback_exists:
+            raise HTTPException(404, "Risk alert not found")
+
+        await db.execute(
+            """
+            INSERT INTO risk_alert_states (feedback_id, status, updated_at, resolved_at)
+            VALUES (
+                $1::uuid,
+                $2::varchar,
+                CURRENT_TIMESTAMP,
+                CASE WHEN $2::varchar = 'resolved' THEN CURRENT_TIMESTAMP ELSE NULL END
+            )
+            ON CONFLICT (feedback_id)
+            DO UPDATE SET
+                status = EXCLUDED.status,
+                updated_at = CURRENT_TIMESTAMP,
+                resolved_at = CASE
+                    WHEN EXCLUDED.status = 'resolved' THEN CURRENT_TIMESTAMP
+                    ELSE NULL
+                END
+            """,
+            alert_id,
+            status,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_text = str(e)
+        if "risk_alert_states" in error_text:
+            await db.create_tables()
+            await db.execute(
+                """
+                INSERT INTO risk_alert_states (feedback_id, status, updated_at, resolved_at)
+                VALUES (
+                    $1::uuid,
+                    $2::varchar,
+                    CURRENT_TIMESTAMP,
+                    CASE WHEN $2::varchar = 'resolved' THEN CURRENT_TIMESTAMP ELSE NULL END
+                )
+                ON CONFLICT (feedback_id)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    updated_at = CURRENT_TIMESTAMP,
+                    resolved_at = CASE
+                        WHEN EXCLUDED.status = 'resolved' THEN CURRENT_TIMESTAMP
+                        ELSE NULL
+                    END
+                """,
+                alert_id,
+                status,
+            )
+            return
+        raise HTTPException(500, f"Unable to update risk alert status: {error_text}")
+
+
+async def load_cache_from_db():
+    """Load feedback and upload cache from database on startup."""
+    if not db.pool:
+        return
+
+    upload_rows = await db.fetch(
+        """
+        SELECT id, filename, total_rows, status, uploaded_at
+        FROM upload_sessions
+        ORDER BY uploaded_at DESC
+        LIMIT 100
+        """
+    )
+
+    feedback_rows = await db.fetch(
+        """
+        SELECT
+            fe.id,
+            fe.original_text,
+            fe.created_at,
+            ar.issue_category,
+            ar.sentiment,
+            ar.priority,
+            ar.confidence
+        FROM feedback_entries fe
+        LEFT JOIN analysis_results ar ON ar.feedback_id = fe.id
+        ORDER BY fe.created_at ASC
+        """
+    )
+
+    uploads.clear()
+    for row in reversed(upload_rows):
+        uploads.append(
+            {
+                "id": str(row["id"]),
+                "filename": row["filename"],
+                "total_rows": row["total_rows"] or 0,
+                "status": row["status"] or "completed",
+                "uploaded_at": (row["uploaded_at"] or datetime.now()).isoformat(),
+            }
+        )
+
+    feedbacks.clear()
+    for row in feedback_rows:
+        feedbacks.append(
+            {
+                "id": str(row["id"]),
+                "text": row["original_text"],
+                "category": row["issue_category"] or "General Inquiry",
+                "sentiment": row["sentiment"] or "Neutral",
+                "priority": row["priority"] or "Low",
+                "timestamp": (row["created_at"] or datetime.now()).isoformat(),
+                "confidence": float(row["confidence"] or 0.7),
+            }
+        )
+
+
+def format_time_ago(timestamp_str):
+    """Convert ISO timestamp to compact relative time string."""
+    try:
+        event_time = datetime.fromisoformat(timestamp_str)
+    except Exception:
+        return "just now"
+
+    delta = datetime.now() - event_time
+    seconds = int(delta.total_seconds())
+
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} hour ago" if seconds < 7200 else f"{seconds // 3600} hours ago"
+    days = seconds // 86400
+    return f"{days} day ago" if days == 1 else f"{days} days ago"
+
+
+async def persist_feedback_record(text, analysis, upload_session_id=None):
+    """Persist feedback and analysis in DB; return created feedback payload."""
+    feedback_id = str(uuid.uuid4())
+
+    if db.pool:
+        await db.execute(
+            """
+            INSERT INTO feedback_entries (id, upload_session_id, original_text, source_channel)
+            VALUES ($1::uuid, $2::uuid, $3, $4)
+            """,
+            feedback_id,
+            upload_session_id,
+            text,
+            "upload",
+        )
+
+        await db.execute(
+            """
+            INSERT INTO analysis_results (feedback_id, issue_category, confidence, sentiment, priority)
+            VALUES ($1::uuid, $2, $3, $4, $5)
+            """,
+            feedback_id,
+            analysis["category"],
+            float(analysis.get("confidence", 0.7)),
+            analysis["sentiment"],
+            analysis["priority"],
+        )
+
+    created_at = datetime.now().isoformat()
+    return {
+        "id": feedback_id,
+        "text": text,
+        "category": analysis["category"],
+        "sentiment": analysis["sentiment"],
+        "priority": analysis["priority"],
+        "timestamp": created_at,
+        "confidence": float(analysis.get("confidence", 0.7)),
+    }
 
 
 @app.get("/")
@@ -218,15 +442,17 @@ async def upload_file(file: UploadFile = File(...)):
     """Upload and analyze CSV file - LLM guesses all fields"""
     
     print(f"📁 Received file: {file.filename}")
-    
+
     if not file.filename.endswith('.csv'):
         raise HTTPException(400, "Only CSV files allowed")
     
+    upload_session_id = None
+
     try:
         # Read file content
         content = await file.read()
         print(f"📊 File size: {len(content)} bytes")
-        
+            
         # Try different encodings
         encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
         decoded_content = None
@@ -280,6 +506,22 @@ async def upload_file(file: UploadFile = File(...)):
         
         if len(df) == 0:
             raise HTTPException(400, "No valid feedback entries found in CSV")
+
+        # Persist upload session first so rows can reference it.
+        upload_session_id = str(uuid.uuid4())
+        if db.pool:
+            await db.execute(
+                """
+                INSERT INTO upload_sessions (id, filename, file_size, total_rows, processed_rows, status)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6)
+                """,
+                upload_session_id,
+                file.filename,
+                len(content),
+                len(df),
+                0,
+                "processing",
+            )
         
         # Process feedbacks with LLM
         results = []
@@ -291,14 +533,7 @@ async def upload_file(file: UploadFile = File(...)):
             # Use Ollama for analysis
             analysis = await analyze_with_ollama(text)
             
-            result = {
-                "id": str(uuid.uuid4()),
-                "text": text,
-                "category": analysis["category"],
-                "sentiment": analysis["sentiment"],
-                "priority": analysis["priority"],
-                "timestamp": datetime.now().isoformat()
-            }
+            result = await persist_feedback_record(text, analysis, upload_session_id)
             feedbacks.append(result)
             results.append(result)
             
@@ -308,13 +543,26 @@ async def upload_file(file: UploadFile = File(...)):
         
         # Create upload record
         upload_record = {
-            "id": str(uuid.uuid4()),
+            "id": upload_session_id or str(uuid.uuid4()),
             "filename": file.filename,
             "total_rows": len(results),
             "status": "completed",
             "uploaded_at": datetime.now().isoformat()
         }
         uploads.append(upload_record)
+
+        if db.pool and upload_session_id:
+            await db.execute(
+                """
+                UPDATE upload_sessions
+                SET processed_rows = $2,
+                    status = 'completed',
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE id = $1::uuid
+                """,
+                upload_session_id,
+                len(results),
+            )
         
         # Calculate summary statistics
         categories = {}
@@ -326,7 +574,7 @@ async def upload_file(file: UploadFile = File(...)):
             sentiments[r["sentiment"]] += 1
             priorities[r["priority"]] += 1
         
-        print(f"✅ Success: {len(results)} items processed")
+        print(f"Success: {len(results)} items processed")
         
         return {
             "message": "File processed successfully with AI",
@@ -344,6 +592,18 @@ async def upload_file(file: UploadFile = File(...)):
     except pd.errors.EmptyDataError:
         raise HTTPException(400, "CSV file is empty")
     except Exception as e:
+        if db.pool and upload_session_id:
+            await db.execute(
+                """
+                UPDATE upload_sessions
+                SET status = 'failed',
+                    error_message = $2,
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE id = $1::uuid
+                """,
+                upload_session_id,
+                str(e),
+            )
         print(f"❌ Error: {str(e)}")
         raise HTTPException(500, detail=str(e))
 
@@ -351,9 +611,13 @@ async def upload_file(file: UploadFile = File(...)):
 async def analyze_single_feedback(text: str):
     """Analyze a single feedback text with Ollama"""
     analysis = await analyze_with_ollama(text)
+    result = await persist_feedback_record(text, analysis)
+    feedbacks.append(result)
     return {
         "text": text,
-        "analysis": analysis
+        "analysis": analysis,
+        "saved": True,
+        "feedback_id": result["id"]
     }
 
 @app.get("/api/recent-uploads")
@@ -397,16 +661,73 @@ async def get_dashboard():
         categories[f["category"]] = categories.get(f["category"], 0) + 1
         priority_counts[f["priority"]] += 1
     
+    top_categories = sorted(categories.items(), key=lambda item: item[1], reverse=True)[:6]
+    category_data = [{"name": name, "count": count} for name, count in top_categories]
+    recent_feedbacks = sorted(feedbacks, key=lambda x: x.get("timestamp", ""), reverse=True)[:5]
+    recent_serialized = [
+        {
+            "id": item["id"],
+            "text": item["text"],
+            "category": item["category"],
+            "sentiment": item["sentiment"],
+            "priority": item["priority"],
+            "time": format_time_ago(item.get("timestamp", "")),
+        }
+        for item in recent_feedbacks
+    ]
+
     return {
         "total_feedback": total,
+        "total": total,
         "positive_count": sentiments["Positive"],
+        "positive": sentiments["Positive"],
         "neutral_count": sentiments["Neutral"],
+        "neutral": sentiments["Neutral"],
         "negative_count": sentiments["Negative"],
+        "negative": sentiments["Negative"],
         "critical_count": priority_counts["High"],
+        "critical": priority_counts["High"],
         "high_priority_count": priority_counts["High"],
+        "high": priority_counts["High"],
         "medium_priority_count": priority_counts["Medium"],
+        "medium": priority_counts["Medium"],
         "low_priority_count": priority_counts["Low"],
-        "categories": categories
+        "low": priority_counts["Low"],
+        "categories": categories,
+        "category_data": category_data,
+        "recent_feedbacks": recent_serialized,
+    }
+
+
+@app.get("/api/dashboard/recent-feedback")
+async def get_dashboard_recent_feedback(limit: int = 5):
+    """Get latest feedback cards formatted for dashboard UI."""
+    recent_feedbacks = sorted(feedbacks, key=lambda x: x.get("timestamp", ""), reverse=True)[:limit]
+    return {
+        "feedbacks": [
+            {
+                "id": item["id"],
+                "text": item["text"],
+                "category": item["category"],
+                "sentiment": item["sentiment"],
+                "priority": item["priority"],
+                "time": format_time_ago(item.get("timestamp", "")),
+            }
+            for item in recent_feedbacks
+        ]
+    }
+
+
+@app.get("/api/dashboard/top-issues")
+async def get_dashboard_top_issues(limit: int = 6):
+    """Get top issue categories with counts for dashboard bars."""
+    categories = {}
+    for item in feedbacks:
+        categories[item["category"]] = categories.get(item["category"], 0) + 1
+
+    top_categories = sorted(categories.items(), key=lambda item: item[1], reverse=True)[:limit]
+    return {
+        "issues": [{"name": name, "count": count} for name, count in top_categories]
     }
     
     
@@ -414,9 +735,10 @@ async def get_dashboard():
 async def get_risk_alerts():
     """Get risk alerts from feedbacks - Simplified for college project"""
     
+    status_map = await get_risk_alert_status_map()
     risk_alerts = []
     
-    for idx, f in enumerate(feedbacks[-20:]):  # Last 20 feedbacks
+    for idx, f in enumerate(feedbacks):  
         text_lower = f["text"].lower()
         
         # Simple risk detection
@@ -438,18 +760,12 @@ async def get_risk_alerts():
         else:
             continue  # Skip if not a risk
         
-        # Generate realistic time
-        import random
-        minutes = random.randint(1, 180)
-        if minutes < 60:
-            time_str = f"{minutes} minutes ago"
-        else:
-            hours = minutes // 60
-            time_str = f"{hours} hours ago"
-        
-        # Status based on index
-        statuses = ['new', 'investigating', 'in_progress', 'resolved']
-        status = statuses[idx % 4]
+        # Use real feedback timestamp for consistent alert time display.
+        time_str = format_time_ago(f.get("timestamp", ""))
+
+        # Persisted status overrides defaults.
+        default_status = "investigating" if severity == "Critical" else "new"
+        status = status_map.get(f["id"], default_status)
         
         risk_alerts.append({
             "id": f["id"],
@@ -477,14 +793,14 @@ async def get_risk_alerts():
 @app.post("/api/risk-alerts/{alert_id}/resolve")
 async def resolve_risk_alert(alert_id: str):
     """Mark a risk alert as resolved"""
-    # In a real app, you'd update the database
-    # For now, just return success
-    return {"message": "Alert resolved successfully", "id": alert_id}
+    await persist_risk_alert_status(alert_id, "resolved")
+    return {"message": "Alert resolved successfully", "id": alert_id, "status": "resolved"}
 
 # ============= ANALYTICS ENDPOINTS =============
 # Add these after your existing code, before the Reports endpoints
 
-from datetime import datetime, timedelta
+from datetime import timedelta
+
 
 @app.get("/api/analytics/summary")
 async def get_analytics_summary(date_range: str = "7"):
@@ -757,9 +1073,8 @@ async def export_analytics(date_range: str = "7", format: str = "csv"):
 # ============= REPORTS ENDPOINTS =============
 # Add these after your Analytics endpoints
 
-from datetime import datetime, timedelta
-from fastapi.responses import StreamingResponse
 import io
+
 
 @app.get("/api/reports/recent")
 async def get_recent_reports():

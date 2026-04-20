@@ -64,7 +64,7 @@ const Reports = () => {
         setGeneratedReport(data);
         setShowReportModal(true);
       } else {
-        // For CSV/PDF, download the file
+        
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
